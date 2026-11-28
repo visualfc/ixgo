@@ -539,7 +539,7 @@ func referenceGCRegsAt(pfn *function, pc int) []register {
 			delete(live, v)
 		}
 		if _, ok := instr.(*ssa.Phi); !ok {
-			ops = instr.Operands(ops[:0])
+			ops = closureLivenessOperands(instr, ops[:0])
 			for _, op := range ops {
 				if *op != nil {
 					live[*op] = true

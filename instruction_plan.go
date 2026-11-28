@@ -15,13 +15,24 @@ func planInstructionLayout(pfn *function) {
 	for _, block := range pfn.Fn.Blocks {
 		for _, instr := range block.Instrs {
 			if value, ok := instr.(ssa.Value); ok {
-				pfn.regIndex(value)
+				if closure, ok := value.(*ssa.MakeClosure); !ok || !skipCallOnlyClosure(closure) {
+					pfn.regIndex(value)
+				}
 			}
 			for _, operand := range instr.Operands(buf[:0]) {
 				if operand != nil && *operand != nil {
-					if _, builtin := (*operand).(*ssa.Builtin); !builtin {
-						pfn.regIndex(*operand)
+					if _, builtin := (*operand).(*ssa.Builtin); builtin {
+						continue
 					}
+					if closure, ok := (*operand).(*ssa.MakeClosure); ok && skipCallOnlyClosure(closure) {
+						// The missing closure target is never read; known-body calls
+						// and defers still require all captured binding registers.
+						for _, binding := range closure.Bindings {
+							pfn.regIndex(binding)
+						}
+						continue
+					}
+					pfn.regIndex(*operand)
 				}
 			}
 			switch v := instr.(type) {

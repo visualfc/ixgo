@@ -5928,3 +5928,54 @@ func TestInstructionDirectPhiPlan(t *testing.T) {
 		})
 	}
 }
+
+func TestElidedClosureHasNoFrameSlot(t *testing.T) {
+	const source = `package main
+func Direct(n int)int {f:=func()int{return n};return f()}
+func Deferred(n int)(r int){defer func(){r=n}();return}
+func Escaping(n int)func()int{return func()int{return n}}
+func Run()int{return Direct(7)+Deferred(8)+Escaping(9)()}
+`
+	for _, mode := range []Mode{EnableInstructionDescriptions, EnableInstructionExecution, EnableInstructionDescriptions | ExperimentalSupportGC, EnableInstructionExecution | ExperimentalSupportGC | EnableGCExecutionPlan} {
+		i, err := NewContext(DisableMemo|mode).LoadInterp("closure_slots.go", source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := i.RunFunc("Run")
+		if err != nil || got != 24 {
+			t.Fatalf("mode %v: %v,%v", mode, got, err)
+		}
+		elided, retained := 0, 0
+		for _, p := range i.funcs {
+			for _, block := range p.Fn.Blocks {
+				for _, instr := range block.Instrs {
+					c, ok := instr.(*ssa.MakeClosure)
+					if !ok {
+						continue
+					}
+					_, allocated := p.index[c]
+					if skipCallOnlyClosure(c) {
+						elided++
+						if allocated || descriptionRegister(p, c) != -1 {
+							t.Fatalf("%s: elided closure owns frame slot", p.Fn)
+						}
+						for _, binding := range c.Bindings {
+							if _, ok := p.index[binding]; !ok {
+								t.Fatalf("%s: capture not allocated", p.Fn)
+							}
+						}
+					} else {
+						retained++
+						if !allocated {
+							t.Fatalf("%s: observable closure has no slot", p.Fn)
+						}
+					}
+				}
+			}
+		}
+		if elided < 2 || retained == 0 {
+			t.Fatalf("elided=%d retained=%d", elided, retained)
+		}
+		i.UnsafeRelease()
+	}
+}

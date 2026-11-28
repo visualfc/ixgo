@@ -1416,7 +1416,10 @@ func makeDebugRef(interp *Interp, pfn *function, instr *ssa.DebugRef) func(*fram
 }
 
 func getCallIndex(pfn *function, call *ssa.CallCommon) (iv register, ia []register, ib []register) {
-	iv = pfn.regIndex(call.Value)
+	iv = -1
+	if closure, ok := call.Value.(*ssa.MakeClosure); !ok || !skipCallOnlyClosure(closure) {
+		iv = pfn.regIndex(call.Value)
+	}
 	ia = make([]register, len(call.Args))
 	for i, v := range call.Args {
 		ia[i] = pfn.regIndex(v)

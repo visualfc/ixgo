@@ -75,3 +75,21 @@ func skipCallOnlyClosure(closure *ssa.MakeClosure) bool {
 	}
 	return true
 }
+
+// closureLivenessOperands exposes captured values read by calls whose closure
+// target has no frame slot. Materialized closures use the capture graph instead.
+func closureLivenessOperands(instr ssa.Instruction, buf []*ssa.Value) []*ssa.Value {
+	ops := instr.Operands(buf)
+	count := len(ops)
+	for _, op := range ops[:count] {
+		if op == nil {
+			continue
+		}
+		if closure, ok := (*op).(*ssa.MakeClosure); ok && skipCallOnlyClosure(closure) {
+			for i := range closure.Bindings {
+				ops = append(ops, &closure.Bindings[i])
+			}
+		}
+	}
+	return ops
+}

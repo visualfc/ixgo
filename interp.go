@@ -368,7 +368,7 @@ func (pfn *function) compileGCLiveness() *gcLivenessPlan {
 			}
 		}
 		if _, ok := instr.(*ssa.Phi); !ok {
-			ops = instr.Operands(ops[:0])
+			ops = closureLivenessOperands(instr, ops[:0])
 			for _, op := range ops {
 				if *op != nil {
 					if reg := regFor(*op); reg >= 0 {
@@ -424,7 +424,7 @@ func (pfn *function) compileGCLiveness() *gcLivenessPlan {
 				tr.def = regFor(v)
 			}
 			if _, ok := instr.(*ssa.Phi); !ok {
-				ops = instr.Operands(ops[:0])
+				ops = closureLivenessOperands(instr, ops[:0])
 				for _, op := range ops {
 					if *op != nil {
 						if reg := regFor(*op); reg >= 0 {
@@ -627,7 +627,11 @@ func (pfn *function) initClosureCaptures() {
 			if !ok {
 				continue
 			}
-			c := closureCapture{result: int(pfn.regIndex(mc))}
+			encoded, allocated := pfn.index[mc]
+			if !allocated {
+				continue
+			}
+			c := closureCapture{result: int(encoded & 0xffffff)}
 			for _, b := range mc.Bindings {
 				if b == nil {
 					continue
