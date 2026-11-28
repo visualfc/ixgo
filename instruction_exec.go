@@ -1188,9 +1188,7 @@ func makeInvokeInstruction(interp *Interp, d typedInstruction, aux invokeCallAux
 		// Find an interpreted method.
 		if mset, ok := interp.msets[rtype]; ok {
 			if fn, ok := mset[mname]; ok {
-				method = func(fr *frame) {
-					interp.callFunctionByStack(fr, fn, ir, ia, dests)
-				}
+				method = makeBodyCallInstruction(interp, fn, ir, ia, dests)
 			} else {
 				ext, found := findUserMethod(rtype, mname)
 				if !found {

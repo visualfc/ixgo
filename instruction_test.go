@@ -5797,3 +5797,84 @@ func Run(n int)(r int) {f:=func(){r=n};defer f();return}`
 		i.UnsafeRelease()
 	}
 }
+
+func TestInstructionInvokeKnownBody(t *testing.T) {
+	const source = `package main
+import "runtime"
+type target interface { Value()int; Pair()(int,int); Touch(*int) }
+type first int
+type second int
+func(v first)Value()int {runtime.GC();return int(v)}
+func(v first)Pair()(int,int){return int(v),2}
+func(v first)Touch(p *int){*p+=int(v)}
+func(v second)Value()(r int){defer func(){if recover()!=nil {r=int(v)}}();panic("method")}
+func(v second)Pair()(a,b int){defer func(){b++}();return int(v),1}
+func(v second)Touch(p *int){defer func(){*p+=int(v)}()}
+func Run(n int)int {
+ var v target=first(40)
+ if n!=0 {v=second(40)}
+ p:=0;v.Touch(&p)
+ a,b:=v.Pair()
+ return v.Value()+a+b+p
+}
+func Discard(n int) {var v target=first(n);v.Value();v.Pair();v.Touch(new(int))}
+func Nil()int {var v target;return v.Value()}
+`
+	for _, extra := range []Mode{0, ExperimentalSupportGC | EnableGCExecutionPlan} {
+		for _, instrument := range []string{"plain", "hooks", "tracker", "debug"} {
+			t.Run(fmt.Sprintf("%v/%s", extra, instrument), func(t *testing.T) {
+				ctx := NewContext(DisableMemo | EnableInstructionExecution | extra)
+				entries, leaves, events, debug := 0, 0, 0, 0
+				switch instrument {
+				case "hooks":
+					ctx.SetFuncHook(func(info *FuncInfo) {
+						if info.Signature.Recv() != nil {
+							entries++
+						}
+					}, func(info *FuncInfo) {
+						if info.Signature.Recv() != nil {
+							leaves++
+						}
+					})
+				case "tracker":
+					tracker := NewExecutionTracker(func(ExecutionPosition) { events++ })
+					defer tracker.Close()
+					ctx.SetExecutionTracker(tracker)
+				case "debug":
+					ctx.SetDebug(func(*DebugInfo) { debug++ })
+				}
+				i, err := ctx.LoadInterp("invoke_body.go", source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer i.UnsafeRelease()
+				for _, n := range []int{0, 1, 0, 1} {
+					got, err := i.RunFunc("Run", n)
+					if err != nil || got != 122 {
+						t.Fatalf("Run(%d)=%v,%v", n, got, err)
+					}
+				}
+				if _, err := i.RunFunc("Discard", 3); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := i.RunFunc("Nil"); err == nil || !strings.Contains(err.Error(), "invalid memory address") {
+					t.Fatalf("nil invoke: %v", err)
+				}
+				switch instrument {
+				case "hooks":
+					if entries == 0 || leaves == 0 {
+						t.Fatalf("hooks=%d/%d", entries, leaves)
+					}
+				case "tracker":
+					if events == 0 {
+						t.Fatal("no tracker events")
+					}
+				case "debug":
+					if debug == 0 {
+						t.Fatal("no debug events")
+					}
+				}
+			})
+		}
+	}
+}
