@@ -5525,7 +5525,7 @@ func Goroutine(n int)int {ch:=make(chan int,1);f:=func(){ch<-n};go f();return <-
 				for _, b := range p.Fn.Blocks {
 					for _, instr := range b.Instrs {
 						if c, ok := instr.(*ssa.MakeClosure); ok && p.Fn.Name() == "Direct" {
-							if !skipDirectCallClosure(c) {
+							if !skipCallOnlyClosure(c) {
 								t.Fatal("direct closure not eligible")
 							}
 							direct++
@@ -5663,5 +5663,137 @@ func Both()int {n:=new(int);*n=7;f:=func(g any)int{return *n};return f(f)}
 				}
 			})
 		}
+	}
+}
+
+func TestDeferClosureMaterialization(t *testing.T) {
+	const source = `package main
+import "runtime"
+func Snapshot()(r int) {
+ x:=1; f:=func(v int){runtime.GC();r=r*10+x+v}
+ defer f(x)
+ x=4
+ defer f(2)
+ runtime.GC()
+ return
+}
+func Loop()(r int) {
+ for j:=0;j<3;j++ {v:=j;defer func(){runtime.GC();r=r*10+v}()}
+ return
+}
+func Recover()(r int) {
+ defer func(){if recover()!=nil {r=42}}()
+ panic("test")
+}
+func Mixed()(r int) { f:=func(){r++}; f();defer f();return }
+type receiver struct{n int;out *int}
+func(v receiver)Add(){*v.out=*v.out*10+v.n}
+func Methods()(r int){for j:=0;j<3;j++ {v:=receiver{j,&r};f:=v.Add;defer f();v.n=9};runtime.GC();return}
+func GoDefer()(r int){ch:=make(chan int,2);f:=func(){ch<-7};go f();defer f();return <-ch}
+var saved func()
+func Escape()(r int) { f:=func(){r++}; saved=f;defer f();return }
+`
+	for _, backend := range []Mode{EnableInstructionDescriptions, EnableInstructionExecution} {
+		for _, gc := range []Mode{0, ExperimentalSupportGC, ExperimentalSupportGC | EnableGCExecutionPlan} {
+			t.Run(fmt.Sprint(backend|gc), func(t *testing.T) {
+				i, err := NewContext(DisableMemo|backend|gc).LoadInterp("defer_closure.go", source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer i.UnsafeRelease()
+				for _, tc := range []struct {
+					name string
+					want int
+				}{{"Snapshot", 65}, {"Loop", 210}, {"Recover", 42}, {"Mixed", 2}, {"Escape", 1}, {"Methods", 210}, {"GoDefer", 7}} {
+					got, err := i.RunFunc(tc.name)
+					if err != nil || got != tc.want {
+						t.Fatalf("%s=%v,%v;want %d", tc.name, got, err, tc.want)
+					}
+				}
+				for _, p := range i.funcs {
+					if p.Fn.Name() == "Snapshot" || p.Fn.Name() == "Loop" || p.Fn.Name() == "Recover" || p.Fn.Name() == "Mixed" {
+						for _, instr := range p.ssaInstrs {
+							if _, ok := instr.(*ssa.MakeClosure); ok {
+								t.Fatalf("%s materializes defer-only closure", p.Fn)
+							}
+						}
+					}
+					if p.Fn.Name() == "Escape" || p.Fn.Name() == "GoDefer" {
+						found := false
+						for _, instr := range p.ssaInstrs {
+							if _, ok := instr.(*ssa.MakeClosure); ok {
+								found = true
+							}
+						}
+						if !found {
+							t.Fatal("escaping defer closure was elided")
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkDeferClosureMaterialization(b *testing.B) {
+	for _, mode := range []Mode{0, EnableInstructionExecution} {
+		b.Run(fmt.Sprint(mode), func(b *testing.B) {
+			ctx := NewContext(DisableMemo | mode)
+			ctx.SetLeastCallForEnablePool(0)
+			i, err := ctx.LoadInterp("defer_perf.go", executionDescriptionSource)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(i.UnsafeRelease)
+			for n := 0; n < 10; n++ {
+				if v, e := i.RunFunc("deferred"); e != nil || v != 42 {
+					b.Fatalf("%v,%v", v, e)
+				}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if v, e := i.RunFunc("deferred"); e != nil || v != 42 {
+					b.Fatalf("%v,%v", v, e)
+				}
+			}
+		})
+	}
+}
+
+func TestDeferClosureDebugObservability(t *testing.T) {
+	const source = `package main
+func Run(n int)(r int) {f:=func(){r=n};defer f();return}`
+	for _, mode := range []Mode{EnableInstructionDescriptions, EnableInstructionExecution} {
+		ctx := NewContext(DisableMemo | mode)
+		seen := false
+		ctx.SetDebug(func(info *DebugInfo) {
+			if _, v, ok := info.AsVar(); ok && reflect.TypeOf(v) != nil && reflect.TypeOf(v).Kind() == reflect.Func {
+				seen = true
+			}
+		})
+		i, err := ctx.LoadInterp("defer_debug.go", source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := i.RunFunc("Run", 42)
+		if err != nil || got != 42 {
+			t.Fatalf("%v,%v", got, err)
+		}
+		if !seen {
+			t.Fatal("debug-visible deferred function was lost")
+		}
+		retained := false
+		for _, p := range i.funcs {
+			for _, instr := range p.ssaInstrs {
+				if _, ok := instr.(*ssa.MakeClosure); ok {
+					retained = true
+				}
+			}
+		}
+		if !retained {
+			t.Fatal("debug-visible defer closure was elided")
+		}
+		i.UnsafeRelease()
 	}
 }

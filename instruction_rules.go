@@ -46,19 +46,28 @@ func recordPackageInitStore(pfn *function, store *ssa.Store) {
 	}
 }
 
-// skipDirectCallClosure omits a function value only when every use invokes the
-// known closure body. Other uses, including DebugRef, keep it observable.
-func skipDirectCallClosure(closure *ssa.MakeClosure) bool {
+// skipCallOnlyClosure omits function values used only for known-body calls or
+// defers. Defer preparation snapshots bindings before returning to the caller.
+// Other uses, including Go and DebugRef, keep the function value observable.
+func skipCallOnlyClosure(closure *ssa.MakeClosure) bool {
 	refs := closure.Referrers()
 	if refs == nil || len(*refs) == 0 {
 		return false
 	}
 	for _, ref := range *refs {
-		call, ok := ref.(*ssa.Call)
-		if !ok || call.Call.Value != closure {
+		var call *ssa.CallCommon
+		switch ref := ref.(type) {
+		case *ssa.Call:
+			call = &ref.Call
+		case *ssa.Defer:
+			call = &ref.Call
+		default:
 			return false
 		}
-		for _, arg := range call.Call.Args {
+		if call.Value != closure {
+			return false
+		}
+		for _, arg := range call.Args {
 			if arg == closure {
 				return false
 			}
