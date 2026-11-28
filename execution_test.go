@@ -19,15 +19,19 @@ package ixgo
 import (
 	"fmt"
 	"go/token"
+	"go/types"
 	"maps"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/tools/go/ssa"
 )
 
 func newExecutionRecorder(t *testing.T) *executionRecorder {
@@ -660,7 +664,7 @@ func TestExecutionTrackerCloseOrdersInFlightNotification(t *testing.T) {
 					t.Error(err)
 				}
 				events, active := recorder.snapshot()
-				if !slices.Equal(events, stopped) || len(active) != 0 {
+				if !reflect.DeepEqual(events, stopped) || len(active) != 0 {
 					t.Errorf("in-flight notification changed state after Close: stopped=%v events=%v active=%v", stopped, events, active)
 				}
 			})
@@ -701,7 +705,7 @@ func TestExecutionTrackerReentrantClear(t *testing.T) {
 						t.Errorf("reentrant clear did not supersede the pending clear: pending=%v events=%v active=%v", event, before, active)
 					}
 					recorder.record(event)
-					if after, _ := recorder.snapshot(); !slices.Equal(after, before) {
+					if after, _ := recorder.snapshot(); !reflect.DeepEqual(after, before) {
 						t.Errorf("older clear changed state after reentry: before=%v after=%v", before, after)
 					}
 				}, ExecutionOptions{ReportRepeated: repeated})
@@ -716,7 +720,7 @@ func Nested(n int) int { return n + 2 }
 				}
 				before, _ := recorder.snapshot()
 				tracker.Close()
-				if after, _ := recorder.snapshot(); !slices.Equal(after, before) {
+				if after, _ := recorder.snapshot(); !reflect.DeepEqual(after, before) {
 					t.Errorf("completed clear callbacks left positions to clear again: before=%v after=%v", before, after)
 				}
 			})
@@ -826,7 +830,7 @@ func Worker(n int) int {
 			}
 			runExecution(t, interp, "Worker", 4, 3)
 			mu.Lock()
-			unchanged := slices.Equal(raw, events)
+			unchanged := reflect.DeepEqual(raw, events)
 			mu.Unlock()
 			if !unchanged {
 				t.Error("execution emitted new events after Close")
@@ -1536,3 +1540,715 @@ func concurrent(workers, n int) int {
 
 func singleLine(n int) int { s := 0; for i := 0; i < n; i++ { s += i }; return s }
 `
+
+func TestExecutionStackHostCallbacks(t *testing.T) {
+	const source = `package main
+//line Sprite.spx:10
+func Root() {
+ Host(func() { Child() })
+}
+func Host(callback func()) {}
+//line Stage.spx:20
+func Child() { Check() }
+func Check() {}
+`
+	ctx := NewContext(SupportMultipleInterp | EnableCachedReg)
+	var latest ExecutionPosition
+	var saved ExecutionPosition
+	tracker := NewExecutionTracker(func(event ExecutionPosition) { latest = event }, ExecutionOptions{
+		TrackStack: true,
+		Filter:     func(pos token.Position) bool { return strings.HasSuffix(pos.Filename, ".spx") },
+	})
+	defer tracker.Close()
+	ctx.SetExecutionTracker(tracker)
+	ctx.RegisterExternal("main.Host", func(callback func()) {
+		if latest.Position.Filename != "Sprite.spx" || latest.Position.Line != 11 {
+			t.Fatalf("host position = %v", latest)
+		}
+		callback()
+		if latest.Position.Filename != "Sprite.spx" || latest.Position.Line != 11 {
+			t.Fatalf("callback return = %v", latest)
+		}
+	})
+	ctx.RegisterExternal("main.Check", func() {
+		saved = latest
+		var got []string
+		for _, pos := range latest.Stack {
+			got = append(got, pos.Filename)
+		}
+		if !reflect.DeepEqual(got, []string{"Stage.spx", "Sprite.spx", "Sprite.spx"}) {
+			t.Fatalf("stack files = %v", got)
+		}
+		if latest.Stack[0].Line != 20 || latest.Stack[1].Line != 11 || latest.Stack[2].Line != 11 {
+			t.Fatalf("stack = %v", latest.Stack)
+		}
+	})
+	interp := loadExecution(t, ctx, source)
+	for range 2 {
+		runExecution(t, interp, "Root", nil)
+		if !latest.Clear || len(latest.Stack) != 0 {
+			t.Fatalf("root return = %v", latest)
+		}
+		// Stack snapshots must survive frame pooling and subsequent invocations.
+		if len(saved.Stack) != 3 || saved.Stack[0].Filename != "Stage.spx" {
+			t.Fatalf("retained stack = %v", saved.Stack)
+		}
+	}
+}
+
+func TestExecutionStackSameLineRecursion(t *testing.T) {
+	const source = `package main
+func Root(n int, check func(int)) { check(n); if n > 0 { Root(n-1, check) } }
+`
+	ctx := NewContext(EnableCachedReg)
+	ctx.SetLeastCallForEnablePool(0)
+	var latest ExecutionPosition
+	var snapshots []ExecutionPosition
+	tracker := NewExecutionTracker(func(event ExecutionPosition) { latest = event; snapshots = append(snapshots, event) }, ExecutionOptions{TrackStack: true})
+	defer tracker.Close()
+	ctx.SetExecutionTracker(tracker)
+	interp := loadExecution(t, ctx, source)
+	for range 2 {
+		runExecution(t, interp, "Root", nil, 3, func(n int) {
+			if len(latest.Stack) != 4-n {
+				t.Fatalf("depth at n=%d: %v", n, latest.Stack)
+			}
+		})
+		if !latest.Clear {
+			t.Fatal("root did not clear")
+		}
+	}
+	if len(snapshots[0].Stack) != 1 {
+		t.Fatal("later events mutated an earlier snapshot")
+	}
+}
+
+func TestExecutionStackWaitsForOwnPosition(t *testing.T) {
+	const source = `package main
+//line Sprite.spx:10
+func Root() { Host(Empty, Bridge) }
+func Host(empty func(), bridge func()) {}
+//line generated.go:1
+func Empty() {}
+func Bridge() { Child() }
+//line Sprite.spx:20
+func Child() { Check() }
+func Check() {}
+`
+	ctx := NewContext(SupportMultipleInterp | EnableCachedReg)
+	var latest ExecutionPosition
+	tracker := NewExecutionTracker(func(event ExecutionPosition) { latest = event }, ExecutionOptions{
+		TrackStack: true,
+		Filter:     func(pos token.Position) bool { return strings.HasSuffix(pos.Filename, ".spx") },
+	})
+	defer tracker.Close()
+	ctx.SetExecutionTracker(tracker)
+	checked := false
+	ctx.RegisterExternal("main.Host", func(empty func(), bridge func()) {
+		before := latest
+		if before.Clear || len(before.Stack) != 1 {
+			t.Fatalf("root position = %v", before)
+		}
+		empty()
+		if latest.Sequence != before.Sequence {
+			t.Fatalf("unlocated empty frame reported a change: %v", latest)
+		}
+		bridge()
+		if latest.Clear || !sameLine(latest.Position, before.Position) || len(latest.Stack) != 1 {
+			t.Fatalf("return through unlocated frame lost the caller: %v", latest)
+		}
+	})
+	ctx.RegisterExternal("main.Check", func() {
+		checked = true
+		if len(latest.Stack) != 2 || latest.Stack[0].Line != 20 || latest.Stack[1].Line != 10 {
+			t.Fatalf("expected only located child and root frames: %v", latest.Stack)
+		}
+	})
+	runExecution(t, loadExecution(t, ctx, source), "Root", nil)
+	if !checked || !latest.Clear || len(latest.Stack) != 0 {
+		t.Fatalf("checked=%v, final event=%v", checked, latest)
+	}
+}
+
+func TestExecutionDescriptionWithoutCompilation(t *testing.T) {
+	ctx := NewContext(DisableMemo | ExperimentalSupportGC | EnableGCExecutionPlan)
+	ctx.SetLeastCallForEnablePool(0)
+	interp, err := ctx.LoadInterp("execution_description.go", `package main
+import "runtime"
+type counter int
+func (c counter) Value() int { return int(c) }
+func method() int { var v interface { Value() int } = counter(42); return v.Value() }
+func async() int {
+ ch := make(chan int, 1)
+ go func(n int) { defer close(ch); ch <- n }(42)
+ return <-ch
+}
+func collect() int { p := new(int); *p = 42; runtime.GC(); return *p }
+func pair(n int) (int, int) { return n, n+1 }
+func sum(n int) int {
+ a, b := 0, 1
+ for i := 0; i < n; i++ { a, b = b, a+b }
+ x, y := pair(a)
+ return x+y
+}
+func recovered() (n int) {
+ defer func() { recover(); n = 42 }()
+ panic("test")
+}
+func captured(n int) int { f := func() int { return n+1 }; return f() }
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer interp.UnsafeRelease()
+	functions := make(map[string]*function)
+	gcBefore := make(map[*function][][]register)
+	for fn, p := range interp.funcs {
+		gcBefore[p] = make([][]register, len(p.gcRegs))
+		for pc := range p.gcRegs {
+			gcBefore[p][pc] = slices.Clone(p.gcRegsForPC(pc))
+		}
+		functions[fn.Name()] = p
+		p.functionCompilation = functionCompilation{}
+	}
+	for _, tc := range []struct {
+		name string
+		args []value
+		want value
+	}{
+		{"sum", []value{10}, 111},
+		{"recovered", nil, 42},
+		{"captured", []value{41}, 42},
+		{"method", nil, 42},
+		{"async", nil, 42},
+		{"collect", nil, 42},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := functions[tc.name]
+			if p == nil {
+				t.Fatal("missing function")
+			}
+			for i := 0; i < 3; i++ {
+				got := interp.callFunction(&frame{}, p, tc.args, nil)
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+			hasPosition := false
+			for pc := range p.Instrs {
+				pos := p.PositionForPC(pc)
+				hasPosition = hasPosition || pos.IsValid()
+			}
+			if !hasPosition {
+				t.Fatal("missing source metadata")
+			}
+			if got := runtimeFunc(p).Name(); got == "" {
+				t.Fatal("missing runtime function name")
+			}
+			for pc := range p.gcRegs {
+				if got := p.gcRegsForPC(pc); !slices.Equal(got, gcBefore[p][pc]) {
+					t.Fatalf("GC registers at PC %d = %v, want %v", pc, got, gcBefore[p][pc])
+				}
+			}
+		})
+	}
+}
+
+func TestExecutionDescriptionPositionBounds(t *testing.T) {
+	p := &function{}
+	for _, pc := range []int{-1, 0, 1} {
+		pos := p.PositionForPC(pc)
+		if p.PosForPC(pc).IsValid() || pos.IsValid() {
+			t.Fatalf("unexpected position at %d", pc)
+		}
+	}
+}
+
+func TestExecutionMetadataConcurrent(t *testing.T) {
+	interp, err := NewContext(0).LoadInterp("metadata.go", `package main
+func outer() int { f := func() int { return 42 }; return f() }
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer interp.UnsafeRelease()
+	for _, p := range interp.funcs {
+		if p.metadata.runtimeName != "" {
+			t.Fatal("runtime name was eagerly formatted")
+		}
+	}
+	type metadataExpectation struct {
+		p         *function
+		name      string
+		autogen   bool
+		positions []token.Position
+	}
+	var expected []metadataExpectation
+	for _, p := range interp.funcs {
+		name, autogen := formatRuntimeFuncName(p.Fn.String(), isInterfaceThunk(p.Fn.Signature))
+		positions := make([]token.Position, len(p.ssaInstrs))
+		for pc := range positions {
+			positions[pc] = p.Fn.Prog.Fset.Position(p.PosForPC(pc))
+		}
+		p.functionCompilation = functionCompilation{}
+		expected = append(expected, metadataExpectation{p, name, autogen, positions})
+	}
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Go(func() {
+			for _, want := range expected {
+				if got := runtimeFunc(want.p).Name(); got != want.name {
+					t.Errorf("runtime name = %q, want %q", got, want.name)
+				}
+				if want.p.metadata.autogenerated != want.autogen {
+					t.Error("autogenerated flag changed")
+				}
+				for pc, pos := range want.positions {
+					if got := want.p.PositionForPC(pc); got != pos {
+						t.Errorf("position at PC %d = %v, want %v", pc, got, pos)
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+
+func TestRuntimeFunctionNameFormatting(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		thunk   bool
+		want    string
+		autogen bool
+	}{
+		{"main.outer$1", false, "main.outer.func1", false},
+		{"(*main.T).Value$bound", false, "main.(*T).Value-fm", true},
+		{"main.Value$thunk", true, "main.Value", true},
+		{"main.Value$thunk", false, "main.Value", false},
+		{"struct{ X int }.Value$thunk", false, "struct{ X int }.Value", true},
+	} {
+		name, autogen := formatRuntimeFuncName(tc.name, tc.thunk)
+		if name != tc.want || autogen != tc.autogen {
+			t.Errorf("%q: got %q/%t, want %q/%t", tc.name, name, autogen, tc.want, tc.autogen)
+		}
+	}
+}
+
+func TestRootFrameConstructor(t *testing.T) {
+	fr := rootFrame()
+	if fr.block != -1 || fr.valid() {
+		t.Fatalf("root frame = block %d, valid %v; want -1, false", fr.block, fr.valid())
+	}
+}
+
+func TestRootFrameCallersAndGC(t *testing.T) {
+	const source = `package main
+
+import "runtime"
+
+var gotNames []string
+
+func work(done chan bool) {
+	pcs := make([]uintptr, 16)
+	n := runtime.Callers(1, pcs)
+	if n == 0 {
+		panic("no callers")
+	}
+	frames := runtime.CallersFrames(pcs[:n])
+	names := make([]string, 0, n)
+	for {
+		f, more := frames.Next()
+		if f.Function != "" {
+			names = append(names, f.Function)
+		}
+		if !more {
+			break
+		}
+	}
+	runtime.GC()
+	gotNames = names
+	done <- true
+}
+func main() { done := make(chan bool, 1); go work(done); <-done }
+`
+	for _, tc := range []struct {
+		name string
+		mode Mode
+	}{
+		{"gc", ExperimentalSupportGC},
+		{"gc_cached_registers", ExperimentalSupportGC | EnableCachedReg},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := NewContext(tc.mode)
+			interp, err := ctx.LoadInterp("root_callers.go", source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer interp.UnsafeRelease()
+			if _, err := interp.RunFunc("main"); err != nil {
+				t.Fatal(err)
+			}
+			addr, ok := interp.GetVarAddr("gotNames")
+			if !ok {
+				t.Fatal("missing gotNames global")
+			}
+			names := *addr.(*[]string)
+			workCount := 0
+			for _, name := range names {
+				if name == "main.work" {
+					workCount++
+				}
+			}
+			if workCount != 1 {
+				t.Fatalf("call stack = %v; want exactly one main.work frame", names)
+			}
+		})
+	}
+}
+
+func TestExecutionDescriptionFallbacks(t *testing.T) {
+	interp := loadExecution(t, NewContext(0), "package main\nfunc Root() {}\n")
+	for _, tc := range []struct {
+		name      string
+		wantPanic bool
+	}{
+		{"init", false},
+		{"missing", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := interp.mainpkg.Prog.NewFunction(tc.name, types.NewSignatureType(nil, nil, nil, nil, nil, false), "test")
+			fn.Pkg = interp.mainpkg
+			call := &ssa.CallCommon{Value: fn}
+			if tc.wantPanic {
+				defer func() {
+					if got := recover(); got == nil || !strings.Contains(fmt.Sprint(got), "no code for function") {
+						t.Fatalf("panic = %v", got)
+					}
+				}()
+			}
+			desc := interp.describeCall(call, 0, nil, nil)
+			fnValue, args := desc.prepare(interp, &frame{})
+			if got := interp.call(rootFrame(), fnValue, args, nil); got != nil {
+				t.Fatalf("init result = %v", got)
+			}
+		})
+	}
+
+	for _, withMethods := range []bool{false, true} {
+		t.Run(fmt.Sprintf("methods=%t", withMethods), func(t *testing.T) {
+			v := time.Second
+			typ := reflect.TypeOf(v)
+			if withMethods {
+				interp.msets[typ] = map[string]*function{}
+			} else {
+				delete(interp.msets, typ)
+			}
+			fr := &frame{stack: []value{v}}
+			desc := callDescription{receiver: 0, method: "String"}
+			fn, args := desc.prepare(interp, fr)
+			if got := interp.call(rootFrame(), fn, args, nil); got != "1s" {
+				t.Fatalf("String() = %v", got)
+			}
+			desc.method = "Missing"
+			defer func() {
+				if got := recover(); got == nil || !strings.Contains(fmt.Sprint(got), "no code for method") {
+					t.Fatalf("panic = %v", got)
+				}
+			}()
+			desc.prepare(interp, fr)
+		})
+	}
+}
+
+func TestExecutionBuiltinDescription(t *testing.T) {
+	b := &builtinDescription{name: "println"}
+	if b.Name() != "println" || b.String() != "println" || b.Pos() != token.NoPos || b.Parent() != nil {
+		t.Fatalf("unexpected builtin description: %v", b)
+	}
+	interp := loadExecution(t, NewContext(0), "package main\nfunc Root() {}\n")
+	if got := interp.call(rootFrame(), b, []value{42}, []bool{true}); got != nil {
+		t.Fatalf("println result = %v", got)
+	}
+}
+
+func TestExecutionMetadataNilInstruction(t *testing.T) {
+	interp := loadExecution(t, NewContext(0), "package main\nfunc Root() {}\n")
+	p := interp.funcs[interp.mainpkg.Func("Root")]
+	p.ssaInstrs = append(p.ssaInstrs, nil)
+	p.finishMetadata()
+	if got := p.PosForPC(len(p.ssaInstrs) - 1); got != token.NoPos {
+		t.Fatalf("nil instruction position = %v", got)
+	}
+}
+
+func TestGCLivenessInvalidQueries(t *testing.T) {
+	rootFrame().gc()
+	var plan *gcLivenessPlan
+	if got := plan.regsAt(0); got != nil {
+		t.Fatalf("nil plan registers = %v", got)
+	}
+	plan = &gcLivenessPlan{points: []gcLivenessPoint{{block: -1}}}
+	for _, pc := range []int{-1, 0, 1} {
+		if got := plan.regsAt(pc); got != nil {
+			t.Fatalf("registers at %d = %v", pc, got)
+		}
+	}
+}
+
+// Mutating the original SSA operands after compilation detects accidental
+// runtime reads that clearing functionCompilation alone would leave reachable.
+func TestRuntimeInstructionOperands(t *testing.T) {
+	const source = `package main
+ type numbers []int
+ type counter int
+ func (c counter) Value() int { return int(c) }
+ func selects() int {
+  a, b := make(chan int, 1), make(chan int)
+  a <- 42
+  select { case v := <-a: return v; case <-b: return 0 }
+ }
+ func defaultSelect() int { var c chan int; select { case <-c: return 0; default: return 42 } }
+ func closedSelect() int { c := make(chan *int); close(c); select { case v, ok := <-c: if v == nil && !ok { return 42 }; return 0 } }
+ func sendNilSelect() int {
+  c := make(chan *int, 1)
+  select { case c <- nil: default: return 0 }
+  if <-c == nil { return 42 }; return 0
+ }
+ func sendClosedSelect() int { c := make(chan int); close(c); select { case c <- 1: return 0; default: return 42 } }
+ func nilInterfaceSelect() int {
+  c := make(chan interface{}, 1)
+  select { case c <- nil: default: return 0 }
+  if <-c == nil { return 42 }; return 0
+ }
+ func slices() int { a := numbers{10, 20, 30, 40}; b := a[1:3:4]; return b[0]+len(b)+cap(b)+17 }
+ func omittedBounds() int { a := [3]int{40, 1, 1}; b := a[:]; return b[0]+len(b[1:]) }
+ func stringSlice() int { s := "abc"; if s[1:] == "bc" && s[:2] == "ab" && s[3:] == "" { return 42 }; return 0 }
+ func slicePanic() int { a := []int{1}; n := 2; return len(a[:n]) }
+ func slice3Panic() int { a := []int{1}; n := 2; return len(a[:1:n]) }
+ func negativeSlice() int { a := []int{1}; n := -1; return len(a[n:]) }
+ func makeSlicePanic() int { n := -1; return len(make([]int,n)) }
+ func assertValue() int { var x interface{} = 42; return x.(int) }
+ func assertCommaOK() int { var x interface{} = "wrong"; v, ok := x.(int); if !ok && v == 0 { return 42 }; return 0 }
+ func assertNil() int { var x interface{}; _, ok := x.(int); if !ok { return 42 }; return 0 }
+ func assertTypedNil() int { var x interface{} = (*int)(nil); p, ok := x.(*int); if ok && p == nil { return 42 }; return 0 }
+ func assertInterface() int { var x interface{} = counter(42); return x.(interface{ Value() int }).Value() }
+ func assertPanic() int { var x interface{} = "wrong"; return x.(int) }
+ func assertNilPanic() int { var x interface{}; return x.(int) }
+ func assertMethodPanic() int { var x interface{} = 42; return x.(interface{ Value() int }).Value() }
+ `
+	testGCLivenessModes(t, func(t *testing.T, mode Mode) {
+		ctx := NewContext(DisableMemo | ExperimentalSupportGC | mode)
+		interp, err := ctx.LoadInterp("runtime_operands.go", source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer interp.UnsafeRelease()
+		for _, p := range interp.funcs {
+			for _, instr := range p.ssaInstrs {
+				switch v := instr.(type) {
+				case *ssa.Select:
+					v.Blocking = !v.Blocking
+					v.States = nil
+				case *ssa.Slice:
+					v.Low, v.High, v.Max = nil, nil, nil
+				case *ssa.TypeAssert:
+					v.CommaOk = !v.CommaOk
+					v.AssertedType = nil
+				}
+			}
+			if mode != 0 {
+				p.functionCompilation = functionCompilation{}
+			}
+		}
+		for _, name := range []string{"selects", "defaultSelect", "closedSelect", "sendNilSelect", "nilInterfaceSelect", "slices", "omittedBounds", "stringSlice", "assertValue", "assertCommaOK", "assertNil", "assertTypedNil", "assertInterface"} {
+			t.Run(name, func(t *testing.T) {
+				got, err := interp.RunFunc(name)
+				if err != nil || got != 42 {
+					t.Fatalf("got %v, %v; want 42", got, err)
+				}
+			})
+		}
+		for _, tc := range []struct{ name, message string }{
+			{"sendClosedSelect", "send on closed channel"}, {"slicePanic", "slice bounds out of range"}, {"slice3Panic", "slice bounds out of range"}, {"negativeSlice", "slice bounds out of range"}, {"makeSlicePanic", "makeslice: len out of range"},
+			{"assertPanic", "interface conversion"}, {"assertNilPanic", "interface conversion"}, {"assertMethodPanic", "missing method Value"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := interp.RunFunc(tc.name)
+				if err == nil || !strings.Contains(err.Error(), tc.message) {
+					t.Fatalf("got %v; want %q", err, tc.message)
+				}
+			})
+		}
+	})
+}
+
+func BenchmarkRuntimeInstructionOperands(b *testing.B) {
+	const source = `package main
+func slices() int { a := []int{10,20,30,40}; n:=0; for i:=0;i<100;i++ { n+=len(a[1:3:4]) }; return n }
+func assertions() int { var x interface{} = 2; n:=0; for i:=0;i<100;i++ { v,ok:=x.(int);if ok { n+=v } };return n }
+func selects() int { a:=make(chan int,1);n:=0;for i:=0;i<100;i++ { a<-2;select {case v:=<-a:n+=v;default:} };return n }
+`
+	for _, name := range []string{"slices", "assertions", "selects"} {
+		b.Run(name, func(b *testing.B) {
+			interp, err := NewContext(DisableMemo).LoadInterp("operand_bench.go", source)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(interp.UnsafeRelease)
+			got, err := interp.RunFunc(name)
+			if err != nil || got != 200 {
+				b.Fatalf("got %v, %v; want 200", got, err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := interp.RunFunc(name); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+type phiDirectAssignmentCase struct {
+	name    string
+	results []register
+	edges   [][]register
+	safe    bool
+}
+
+var phiDirectAssignmentCases = []phiDirectAssignmentCase{
+	{"empty", nil, nil, false},
+	{"empty-results", []register{0}, nil, false},
+	{"single", []register{0}, [][]register{{0, 2}}, true},
+	{"independent", []register{0, 1}, [][]register{{2, 3}, {3, 2}}, true},
+	{"safe-chain", []register{0, 1}, [][]register{{1}, {2}}, true},
+	{"unsafe-chain", []register{0, 1}, [][]register{{2}, {0}}, false},
+	{"swap", []register{0, 1}, [][]register{{1}, {0}}, false},
+	{"self", []register{0, 1}, [][]register{{0}, {0}}, true},
+	{"mixed-predecessors", []register{0, 1}, [][]register{{2, 1}, {3, 0}}, false},
+}
+
+func TestPhiDirectAssignmentDependencies(t *testing.T) {
+	for _, c := range phiDirectAssignmentCases {
+		if got := phiDirectAssignment(c.results, c.edges); got != c.safe {
+			t.Fatalf("%s: safe=%t want %t", c.name, got, c.safe)
+		}
+	}
+}
+
+func TestStackMinMaxCalls(t *testing.T) {
+	const source = `package stackminmax
+
+import "math"
+
+type ordered interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr | ~float32 | ~float64 | ~string
+}
+type namedInt int64
+type namedFloat float64
+type namedString string
+
+func bounds[T ordered](a, b, c T) (T, T)                         { return min(c, b, a), max(a, b, c) }
+func invoke[T ordered](f func(T, T, T) (T, T), a, b, c T) (T, T) { return f(a, b, c) }
+func check[T ordered](a, b, c T) {
+	lo, hi := bounds(a, b, c)
+	if lo != a || hi != c {
+		panic("direct bounds")
+	}
+	lo, hi = invoke(bounds[T], a, b, c)
+	if lo != a || hi != c {
+		panic("dynamic bounds")
+	}
+	if min(b) != b || max(b) != b || min(b, b) != b || max(b, b) != b {
+		panic("single/repeated operands")
+	}
+}
+func zero(a, b int) (int, int)                                  { return min(b, a), max(b, a) }
+func callZero(f func(int, int) (int, int), a, b int) (int, int) { return f(a, b) }
+func floating(a, b float64) (float64, float64)                  { return min(a, b), max(a, b) }
+func callFloat(f func(float64, float64) (float64, float64), a, b float64) (float64, float64) {
+	return f(a, b)
+}
+func Run() int {
+	check[int](-3, 1, 5)
+	check[int8](-3, 1, 5)
+	check[int16](-3, 1, 5)
+	check[int32](-3, 1, 5)
+	check[int64](-3, 1, 5)
+	check[uint](0, 1, 5)
+	check[uint8](0, 1, 5)
+	check[uint16](0, 1, 5)
+	check[uint32](0, 1, 5)
+	check[uint64](0, 1, 5)
+	check[uintptr](0, 1, 5)
+	check[float32](-3, 1, 5)
+	check[float64](-3, 1, 5)
+	check[string]("a", "b", "c")
+	check[namedInt](-3, 1, 5)
+	check[namedFloat](-3, 1, 5)
+	check[namedString]("a", "b", "c")
+	for _, a := range []int{1, 5} {
+		b := 6 - a
+		lo, hi := zero(a, b)
+		if lo != 1 || hi != 5 {
+			panic("direct register zero")
+		}
+		lo, hi = callZero(zero, a, b)
+		if lo != 1 || hi != 5 {
+			panic("dynamic register zero")
+		}
+	}
+	for _, a := range []float64{1, math.NaN()} {
+		b := math.NaN()
+		if math.IsNaN(a) {
+			b = 1
+		}
+		lo, hi := floating(a, b)
+		if !math.IsNaN(lo) || !math.IsNaN(hi) {
+			panic("direct NaN")
+		}
+		lo, hi = callFloat(floating, a, b)
+		if !math.IsNaN(lo) || !math.IsNaN(hi) {
+			panic("dynamic NaN")
+		}
+	}
+	for _, a := range []float64{0, math.Copysign(0, -1)} {
+		b := math.Copysign(0, -1)
+		if math.Signbit(a) {
+			b = 0
+		}
+		lo, hi := floating(a, b)
+		if !math.Signbit(lo) || math.Signbit(hi) {
+			panic("direct signed zero")
+		}
+		lo, hi = callFloat(floating, a, b)
+		if !math.Signbit(lo) || math.Signbit(hi) {
+			panic("dynamic signed zero")
+		}
+	}
+	check[float64](math.Inf(-1), 0, math.Inf(1))
+	return 42
+}
+`
+	for _, mode := range []Mode{0, EnableCachedReg, ExperimentalSupportGC | EnableGCExecutionPlan, DisableDynamicFuncCallAnalysis, DisableDynamicFuncCallAnalysis | EnableCachedReg} {
+		t.Run(fmt.Sprintf("mode=%v", mode), func(t *testing.T) {
+			i, err := NewContext(DisableMemo|mode).LoadInterp("stack_minmax.go", source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer i.UnsafeRelease()
+			for _, p := range i.funcs {
+				if len(p.Code) != 0 {
+					t.Fatal("stack test generated instruction descriptions")
+				}
+				p.functionCompilation = functionCompilation{}
+			}
+			for n := 0; n < 3; n++ {
+				if got, err := i.RunFunc("Run"); err != nil || got != 42 {
+					t.Fatalf("Run=%v,%v want 42", got, err)
+				}
+			}
+		})
+	}
+}

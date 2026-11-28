@@ -20,8 +20,10 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
 	"reflect"
 	"strings"
 	"unsafe"
@@ -32,7 +34,7 @@ import (
 
 // callBuiltin interprets a call to builtin fn with arguments args,
 // returning its result.
-func (inter *Interp) callBuiltin(fr *frame, fn *ssa.Builtin, args []value, ssaArgs []ssa.Value) value {
+func (inter *Interp) callBuiltin(fr *frame, fn builtinFunction, args []value, interfaceArgs []bool) value {
 	switch fnName := fn.Name(); fnName {
 	case "append":
 		if len(args) == 1 {
@@ -70,12 +72,9 @@ func (inter *Interp) callBuiltin(fr *frame, fn *ssa.Builtin, args []value, ssaAr
 			if i > 0 && ln {
 				buf.WriteRune(' ')
 			}
-			if len(ssaArgs) > i {
-				typ := inter.toType(ssaArgs[i].Type())
-				if typ.Kind() == reflect.Interface {
-					writeinterface(&buf, arg)
-					continue
-				}
+			if i < len(interfaceArgs) && interfaceArgs[i] {
+				writeinterface(&buf, arg)
+				continue
 			}
 			writevalue(&buf, arg, inter.ctx.Mode&EnablePrintAny != 0)
 		}
@@ -233,7 +232,7 @@ func (inter *Interp) callBuiltin(fr *frame, fn *ssa.Builtin, args []value, ssaAr
 
 // callBuiltinDiscardsResult interprets a call to builtin fn with arguments args,
 // discards its result.
-func (inter *Interp) callBuiltinDiscardsResult(fr *frame, fn *ssa.Builtin, args []value, ssaArgs []ssa.Value) {
+func (inter *Interp) callBuiltinDiscardsResult(fr *frame, fn builtinFunction, args []value, interfaceArgs []bool) {
 	switch fnName := fn.Name(); fnName {
 	case "append":
 		panic("discards result of " + fnName)
@@ -255,12 +254,9 @@ func (inter *Interp) callBuiltinDiscardsResult(fr *frame, fn *ssa.Builtin, args 
 			if i > 0 && ln {
 				buf.WriteRune(' ')
 			}
-			if len(ssaArgs) > i {
-				typ := inter.toType(ssaArgs[i].Type())
-				if typ.Kind() == reflect.Interface {
-					writeinterface(&buf, arg)
-					continue
-				}
+			if i < len(interfaceArgs) && interfaceArgs[i] {
+				writeinterface(&buf, arg)
+				continue
 			}
 			writevalue(&buf, arg, inter.ctx.Mode&EnablePrintAny != 0)
 		}
@@ -335,7 +331,7 @@ func (inter *Interp) callBuiltinDiscardsResult(fr *frame, fn *ssa.Builtin, args 
 
 // makeBuiltinByStack interprets a call to builtin fn with arguments args,
 // returning its result.
-func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs []ssa.Value, ir register, ia []register) func(fr *frame) {
+func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs []ssa.Value, ir register, ia []register, pos token.Pos) func(fr *frame) {
 	switch fn.Name() {
 	case "append":
 		if len(ia) == 1 {
@@ -382,6 +378,7 @@ func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs
 
 	case "print", "println": // print(any, ...)
 		ln := fn.Name() == "println"
+		interfaceArgs := builtinInterfaceArgs(interp, fn.Name(), ssaArgs)
 		return func(fr *frame) {
 			var buf bytes.Buffer
 			for i := 0; i < len(ia); i++ {
@@ -389,12 +386,9 @@ func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs
 				if i > 0 && ln {
 					buf.WriteRune(' ')
 				}
-				if len(ssaArgs) > i {
-					typ := interp.toType(ssaArgs[i].Type())
-					if typ.Kind() == reflect.Interface {
-						writeinterface(&buf, arg)
-						continue
-					}
+				if i < len(interfaceArgs) && interfaceArgs[i] {
+					writeinterface(&buf, arg)
+					continue
 				}
 				writevalue(&buf, arg, interp.ctx.Mode&EnablePrintAny != 0)
 			}
@@ -588,23 +582,43 @@ func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs
 		return func(fr *frame) {
 			fr.setReg(ir, unsafe.StringData(fr.string(ia[0])))
 		}
-	case "Sizeof": // instance of generic function
-		return func(fr *frame) {
-			typ := reflect.TypeOf(fr.reg(ia[0]))
-			fr.setReg(ir, uintptr(typ.Size()))
+	case "Sizeof", "Alignof": // instances of generic functions
+		typ := ssaArgs[0].Type()
+		if len(ssaArgs) == 2 {
+			// unsaferewrite.Rewrite carries the operand type in a typed pointer.
+			typ = typ.Underlying().(*types.Pointer).Elem()
 		}
-	case "Alignof": // instance of generic function
-		return func(fr *frame) {
-			typ := reflect.TypeOf(fr.reg(ia[0]))
-			fr.setReg(ir, uintptr(typ.Align()))
+		var result uintptr
+		if fn.Name() == "Sizeof" {
+			result = uintptr(interp.ctx.sizes.Sizeof(typ))
+		} else {
+			result = uintptr(interp.ctx.sizes.Alignof(typ))
 		}
+		return func(fr *frame) { fr.setReg(ir, result) }
 	case "Offsetof": // instance of generic function
-		return func(fr *frame) {
-			offset, err := builtinOffsetof(fr, fn, int(fr.ipc)-1)
-			if err != nil {
-				panic(err)
+		var offset int64
+		var err error
+		if len(ssaArgs) > 1 {
+			// unsaferewrite.Rewrite carries the struct type and field-index path.
+			typ := ssaArgs[0].Type().Underlying().(*types.Pointer).Elem()
+			for _, arg := range ssaArgs[1:] {
+				index, _ := constant.Int64Val(arg.(*ssa.Const).Value)
+				st := typ.Underlying().(*types.Struct)
+				offset += structOffsetsof(interp.ctx.sizes, st)[int(index)]
+				typ = st.Field(int(index)).Type()
 			}
-			fr.setReg(ir, uintptr(offset))
+		} else {
+			offset, err = builtinOffsetof(interp.ctx, pos, ssaArgs)
+		}
+		if err != nil {
+			msg := err.Error()
+			return func(fr *frame) {
+				panic(fr.plainError(fn, msg))
+			}
+		}
+		result := uintptr(offset)
+		return func(fr *frame) {
+			fr.setReg(ir, result)
 		}
 	case "clear":
 		return func(fr *frame) {
@@ -614,20 +628,21 @@ func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs
 	case "max":
 		return func(fr *frame) {
 			v := reflect.ValueOf(fr.reg(ia[0]))
-			for _, i := range ia {
-				arg := reflect.ValueOf(fr.reg(i))
+			for i, r := range ia {
+				arg := reflect.ValueOf(fr.reg(r))
 				if i > 0 {
 					switch v.Kind() {
 					case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 						if v.Int() < arg.Int() {
 							v = arg
 						}
-					case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 						if v.Uint() < arg.Uint() {
 							v = arg
 						}
 					case reflect.Float32, reflect.Float64:
-						if v.Float() < arg.Float() {
+						x, y := v.Float(), arg.Float()
+						if x < y || math.IsNaN(y) || x == 0 && y == 0 && !math.Signbit(y) {
 							v = arg
 						}
 					case reflect.String:
@@ -642,20 +657,21 @@ func (interp *Interp) makeBuiltinByStack(pfn *function, fn *ssa.Builtin, ssaArgs
 	case "min":
 		return func(fr *frame) {
 			v := reflect.ValueOf(fr.reg(ia[0]))
-			for _, i := range ia {
-				arg := reflect.ValueOf(fr.reg(i))
+			for i, r := range ia {
+				arg := reflect.ValueOf(fr.reg(r))
 				if i > 0 {
 					switch v.Kind() {
 					case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 						if v.Int() > arg.Int() {
 							v = arg
 						}
-					case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 						if v.Uint() > arg.Uint() {
 							v = arg
 						}
 					case reflect.Float32, reflect.Float64:
-						if v.Float() > arg.Float() {
+						x, y := v.Float(), arg.Float()
+						if x > y || math.IsNaN(y) || x == 0 && y == 0 && math.Signbit(y) {
 							v = arg
 						}
 					case reflect.String:
@@ -695,44 +711,47 @@ func mulUintptr(a, b uintptr) (uintptr, bool) {
 	return a * b, overflow
 }
 
-func builtinOffsetof(fr *frame, fn *ssa.Builtin, pc int) (int64, error) {
-	pfn := fr.pfn
-	pos := pfn.ssaInstrs[pc].Pos()
-	paths, info, ok := pathEnclosingInterval(pfn.Interp.ctx, pos)
-	if !ok {
-		return -1, fr.plainError(fn, "unsafe.Offsetof not found code")
+// builtinOffsetof resolves generic field selections while compiler metadata is available.
+func builtinOffsetof(ctx *Context, pos token.Pos, args []ssa.Value) (int64, error) {
+	if len(args) != 1 {
+		return -1, PlainError("unsafe.Offsetof not found call operand")
+	}
+	paths, info, ok := pathEnclosingInterval(ctx, pos)
+	if !ok || len(paths) == 0 {
+		return -1, PlainError("unsafe.Offsetof not found code")
 	}
 	call, ok := paths[0].(*ast.CallExpr)
-	if !ok {
-		return -1, fr.plainError(fn, "unsafe.Offsetof not found call")
+	if !ok || len(call.Args) != 1 {
+		return -1, PlainError("unsafe.Offsetof not found call")
 	}
-	selx, ok := call.Args[0].(*ast.SelectorExpr)
+	selx, ok := ast.Unparen(call.Args[0]).(*ast.SelectorExpr)
 	if !ok {
-		return -1, fr.plainError(fn, "unsafe.Offsetof not found selector expr")
+		return -1, PlainError("unsafe.Offsetof not found selector expr")
 	}
-	sel, _ := info.Selections[selx]
+	sel := info.Selections[selx]
 	if sel == nil {
-		return -1, fr.plainError(fn, "unsafe.Offsetof not found selector type")
+		return -1, PlainError("unsafe.Offsetof not found selector type")
 	}
-	instrs, found := foundFieldAddr(pfn, pc)
-	if !found || len(sel.Index()) > len(instrs) {
-		return -1, fr.plainError(fn, "unsafe.Offsetof not found FieldAddr instr")
-	}
-	instr := instrs[len(sel.Index())-1]
-	return selOffsetof(pfn.Interp.ctx.sizes, instr.X.Type().Underlying().(*types.Pointer).Elem().Underlying().(*types.Struct), sel.Index(), selx.Sel.Name)
-}
-
-func foundFieldAddr(pfn *function, pc int) (instrs []*ssa.FieldAddr, found bool) {
-	for pc > 0 {
-		pc--
-		if fd, ok := pfn.ssaInstrs[pc].(*ssa.FieldAddr); ok {
-			found = true
-			instrs = append(instrs, fd)
-		} else if found {
-			return
+	// Only implicit selections belong to this offset, not explicit x.A.B steps.
+	operand := args[0]
+	for range sel.Index() {
+		if load, ok := operand.(*ssa.UnOp); ok && load.Op == token.MUL {
+			operand = load.X
+		}
+		switch field := operand.(type) {
+		case *ssa.FieldAddr:
+			operand = field.X
+		case *ssa.Field:
+			operand = field.X
+		default:
+			return -1, PlainError("unsafe.Offsetof not found field operand")
 		}
 	}
-	return
+	typ := operand.Type().Underlying()
+	if ptr, ok := typ.(*types.Pointer); ok {
+		typ = ptr.Elem().Underlying()
+	}
+	return selOffsetof(ctx.sizes, typ, sel.Index(), selx.Sel.Name)
 }
 
 func pathEnclosingInterval(ctx *Context, pos token.Pos) (path []ast.Node, info *types.Info, exact bool) {
@@ -774,9 +793,9 @@ func selOffsetof(sizes types.Sizes, typ types.Type, index []int, sel string) (in
 }
 
 func structOffsetsof(sizes types.Sizes, t *types.Struct) []int64 {
-	var fields []*types.Var
-	for i := 0; i < t.NumFields(); i++ {
-		fields = append(fields, t.Field(i))
+	fields := make([]*types.Var, t.NumFields())
+	for i := range fields {
+		fields[i] = t.Field(i)
 	}
 	return sizes.Offsetsof(fields)
 }

@@ -39,6 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goplus/ixgo/internal/unsaferewrite"
 	"github.com/goplus/ixgo/load"
 	"github.com/goplus/ixgo/load/list"
 	"github.com/goplus/reflectx"
@@ -49,24 +50,27 @@ import (
 type Mode uint
 
 const (
-	DisableRecover                 Mode          = 1 << iota // Disable recover() in target programs; show interpreter crash instead.
-	DisableCustomBuiltin                                     // Disable load custom builtin func
-	EnableDumpImports                                        // print import packages
-	EnableDumpInstr                                          // Print packages & SSA instruction code
-	EnableTracing                                            // Print a trace of all instructions as they are interpreted.
-	EnablePrintAny                                           // Enable builtin print for any type ( struct/array )
-	EnableNoStrict                                           // Enable no strict mode
-	ExperimentalSupportGC                                    // experimental support runtime.GC
-	SupportMultipleInterp                                    // Support multiple interp, must manual release interp reflectx icall.
-	CheckGopOverloadFunc                                     // Check and skip gop overload func
-	DisableAutoLoadPatchs                                    // Disable automatic loading of package patches.
-	DisableDynamicFuncCallAnalysis                           // Disable dynamic func call analysis and optimization.
-	OptionLoadRutimeImethod                                  // Option load runtime imethod for less imethod and memory space.
-	OptionLoadAllImethod                                     // Option load all imethod.
-	EnableCachedReg                                          // Enable per-frame cache registers.
-	DisableMemo                                              // Disable the optional memo optimizer.
-	OptionLoadDefaultImethod       = 0                       // Option load default imethod.
-	LastMode                       = DisableMemo             // Last Mode
+	DisableRecover                 Mode                         = 1 << iota // Disable recover() in target programs; show interpreter crash instead.
+	DisableCustomBuiltin                                                    // Disable load custom builtin func
+	EnableDumpImports                                                       // print import packages
+	EnableDumpInstr                                                         // Print packages & SSA instruction code
+	EnableTracing                                                           // Print a trace of all instructions as they are interpreted.
+	EnablePrintAny                                                          // Enable builtin print for any type ( struct/array )
+	EnableNoStrict                                                          // Enable no strict mode
+	ExperimentalSupportGC                                                   // experimental support runtime.GC
+	SupportMultipleInterp                                                   // Support multiple interp, must manual release interp reflectx icall.
+	CheckGopOverloadFunc                                                    // Check and skip gop overload func
+	DisableAutoLoadPatchs                                                   // Disable automatic loading of package patches.
+	DisableDynamicFuncCallAnalysis                                          // Disable dynamic func call analysis and optimization.
+	OptionLoadRutimeImethod                                                 // Option load runtime imethod for less imethod and memory space.
+	OptionLoadAllImethod                                                    // Option load all imethod.
+	EnableCachedReg                                                         // Enable per-frame cache registers.
+	DisableMemo                                                             // Disable the optional memo optimizer.
+	EnableGCExecutionPlan                                                   // Precompute SSA-free GC liveness plans at load time; requires ExperimentalSupportGC.
+	EnableInstructionDescriptions                                           // Build typed instruction metadata at load time; requires the instruction build tag; independent of GC plans.
+	EnableInstructionExecution                                              // Execute instructions using typed descriptions; requires the instruction build tag; also generates descriptions.
+	OptionLoadDefaultImethod       = 0                                      // Option load default imethod.
+	LastMode                       = EnableInstructionExecution             // Last Mode
 )
 
 // Loader types loader interface
@@ -687,7 +691,7 @@ func (ctx *Context) LoadFile(filename string, src interface{}) (*ssa.Package, er
 	}
 	root, _ := filepath.Split(filename)
 	ctx.setRoot(root)
-	return ctx.LoadAstFile(file.Name.Name, file)
+	return ctx.loadAstFile(file.Name.Name, file)
 }
 
 func (ctx *Context) ParseFile(filename string, src interface{}) (*ast.File, error) {
@@ -704,6 +708,10 @@ func (ctx *Context) ParseFile(filename string, src interface{}) (*ast.File, erro
 }
 
 func (ctx *Context) LoadAstFile(path string, file *ast.File) (*ssa.Package, error) {
+	return ctx.loadAstFile(path, unsaferewrite.Isolate(file))
+}
+
+func (ctx *Context) loadAstFile(path string, file *ast.File) (*ssa.Package, error) {
 	files := []*ast.File{file}
 	if ctx.Mode&DisableCustomBuiltin == 0 {
 		if f, err := ParseBuiltin(ctx.FileSet, file.Name.Name); err == nil {
@@ -740,7 +748,7 @@ func (ctx *Context) LoadAstFile(path string, file *ast.File) (*ssa.Package, erro
 func (ctx *Context) LoadAstPackage(path string, apkg *ast.Package) (*ssa.Package, error) {
 	var files []*ast.File
 	for _, f := range apkg.Files {
-		files = append(files, f)
+		files = append(files, unsaferewrite.Isolate(f))
 	}
 	if ctx.Mode&DisableCustomBuiltin == 0 {
 		if f, err := ParseBuiltin(ctx.FileSet, apkg.Name); err == nil {
@@ -1048,6 +1056,7 @@ func (b *SSABuilder) BuildPackages(pkgs []*types.Package) {
 						fmt.Println("# source", p.Path(), "<memory>")
 					}
 				}
+				unsaferewrite.Rewrite(pkg.Files, pkg.Info)
 				b.prog.CreatePackage(pkg.Package, pkg.Files, pkg.Info, true).Build()
 			} else {
 				b.BuildImports(p, false)
@@ -1069,6 +1078,10 @@ func (b *SSABuilder) BuildPackages(pkgs []*types.Package) {
 	}
 }
 
+// BuildMain builds SSA for sp and its imports. It rewrites sp.Files and sp.Info
+// in place for generic unsafe layout operations. Callers supplying a SourcePackage
+// must give the builder exclusive ownership of its syntax and type information;
+// generic instances may continue to use them after this method returns.
 func (b *SSABuilder) BuildMain(sp *SourcePackage) (pkg *ssa.Package, err error) {
 	b.BuildImports(sp.Package, true)
 	ctx := b.ctx
@@ -1080,6 +1093,7 @@ func (b *SSABuilder) BuildMain(sp *SourcePackage) (pkg *ssa.Package, err error) 
 		}
 	}
 	// Create and build the primary package.
+	unsaferewrite.Rewrite(sp.Files, sp.Info)
 	pkg = b.prog.CreatePackage(sp.Package, sp.Files, sp.Info, false)
 	pkg.Build()
 	return

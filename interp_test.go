@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/goplus/ixgo/memo"
 	"golang.org/x/tools/go/loader"
 
 	"github.com/goplus/ixgo"
@@ -1024,6 +1025,81 @@ func main() {
 	_, err := ixgo.RunFile("main.go", src, nil, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMapNilInterfaces(t *testing.T) {
+	cases := map[string]string{
+		"constant_value": `func main() {
+			m := map[string]any{"x": 1}
+			m["x"] = nil
+			if v, ok := m["x"]; !ok || v != nil || len(m) != 1 { panic("nil assignment lost entry") }
+		}`,
+		"dynamic_value": `func assign(m map[string]any, v any) { m["x"] = v }
+		func main() {
+			m := map[string]any{"x": 1}
+			assign(m, nil)
+			if v, ok := m["x"]; !ok || v != nil || len(m) != 1 { panic("nil assignment lost entry") }
+		}`,
+		"nil_map_constant_value": `func main() {
+			defer func() {
+				if err, ok := recover().(error); !ok || err.Error() != "assignment to entry in nil map" {
+					panic("expected assignment to entry in nil map")
+				}
+			}()
+			var m map[string]any
+			m["x"] = nil
+		}`,
+		"nil_map_dynamic_value": `func assign(m map[string]any, v any) { m["x"] = v }
+		func main() {
+			defer func() {
+				if err, ok := recover().(error); !ok || err.Error() != "assignment to entry in nil map" {
+					panic("expected assignment to entry in nil map")
+				}
+			}()
+			assign(nil, nil)
+		}`,
+		"nil_key": `func main() {
+			m := map[any]any{nil: nil}
+			if v, ok := m[nil]; !ok || v != nil { panic("nil key not present") }
+			m[nil] = 7
+			if m[nil] != 7 || len(m) != 1 { panic("nil key not updated") }
+			delete(m, nil)
+			if _, ok := m[nil]; ok || len(m) != 0 { panic("nil key not deleted") }
+		}`,
+		"dynamic_nil_key": `func check(k any) {
+			m := make(map[any]int)
+			m[k] = 7
+			if v, ok := m[k]; !ok || v != 7 { panic("dynamic nil key not present") }
+			delete(m, k)
+			if m[k] != 0 || len(m) != 0 { panic("dynamic nil key not deleted") }
+		}
+		func main() { check(nil) }`,
+		"nil_map_lookup_and_delete": `func main() {
+			var m map[any]int
+			if v, ok := m[nil]; ok || v != 0 { panic("unexpected nil map lookup") }
+			delete(m, nil)
+		}`,
+		"deferred_delete": `func remove(m map[any]int) { defer delete(m, nil) }
+		func main() {
+			m := map[any]int{nil: 7}
+			remove(m)
+			if len(m) != 0 { panic("deferred delete failed") }
+		}`,
+		"typed_nil": `func main() {
+			var p *int
+			m := map[any]any{nil: nil, p: p}
+			if len(m) != 2 || m[p] != p || m[p] == nil { panic("typed nil lost its type") }
+			delete(m, nil)
+			if len(m) != 1 || m[p] != p { panic("typed nil key confused with nil") }
+		}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ixgo.NewContext(0).RunFile("main.go", "package main\n"+body, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -3900,11 +3976,7 @@ func main() {
 func loadPromotedWrapper(t *testing.T, src string) (*ixgo.Interp, any) {
 	t.Helper()
 	ctx := ixgo.NewContext(ixgo.SupportMultipleInterp)
-	pkg, err := ctx.LoadFile("main.go", src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	interp, err := ctx.NewInterp(pkg)
+	interp, err := ctx.LoadInterp("main.go", src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3980,26 +4052,79 @@ func TestPromotedMethodLayoutReverseOrder(t *testing.T) {
 
 func TestPromotedMethodLayoutIdentical(t *testing.T) {
 	capacity, _, _ := ixgo.IcallStat()
+	if capacity == 0 {
+		t.Skip("skip icall test under llgo or ifacefuncval")
+	}
 	src := promotedWrapperSrc("Prefix int64", "111", 11)
 	want := os.FileMode(11).String()
 
 	a, objA := loadPromotedWrapper(t, src)
-	defer a.UnsafeRelease()
 	callPromotedString(t, "A", objA, want)
+	a.UnsafeRelease()
 	_, allocA, _ := ixgo.IcallStat()
 	cachedA := ixgo.IcallCached()
 
 	b, objB := loadPromotedWrapper(t, src)
-	defer b.UnsafeRelease()
 	callPromotedString(t, "B", objB, want)
-	if capacity == 0 {
-		return
-	}
+	b.UnsafeRelease()
 	_, allocB, _ := ixgo.IcallStat()
 	cachedB := ixgo.IcallCached()
 	if allocB != allocA || cachedB != cachedA {
 		t.Fatalf("identical layouts should reuse icall slots: alloc %d->%d cached %d->%d",
 			allocA, allocB, cachedA, cachedB)
+	}
+}
+
+// TestPromotedMethodLayoutIcallUsage compares the actual icall occupancy of
+// promoted methods. Identical promotion layouts reuse the cached method table;
+// a different promotion layout gets a separate table so the promoted call
+// remains safe.
+func TestPromotedMethodLayoutIcallUsage(t *testing.T) {
+	capacity, _, _ := ixgo.IcallStat()
+	if capacity == 0 {
+		t.Skip("skip icall test under llgo or ifacefuncval")
+	}
+
+	loadAndMeasure := func(src, label, want string) (allocated, cached int) {
+		t.Helper()
+		interp, obj := loadPromotedWrapper(t, src)
+		callPromotedString(t, label, obj, want)
+		interp.UnsafeRelease()
+		_, allocated, _ = ixgo.IcallStat()
+		cached = ixgo.IcallCached()
+		return
+	}
+
+	srcA := promotedWrapperSrc("Prefix int64", "111", 11)
+	allocatedA, cachedA := loadAndMeasure(srcA, "A", os.FileMode(11).String())
+	allocatedSame, cachedSame := loadAndMeasure(srcA, "same", os.FileMode(11).String())
+	if allocatedSame != allocatedA || cachedSame != cachedA {
+		t.Fatalf("identical promoted layouts changed icall usage: alloc %d->%d cached %d->%d",
+			allocatedA, allocatedSame, cachedA, cachedSame)
+	}
+
+	// The trailing field changes the outer type size while preserving the
+	// promoted method's index and offset. It must reuse the existing table.
+	srcTrailing := `package main
+
+import "os"
+
+type Wrapper struct {
+	Prefix int64
+	os.FileMode
+	Extra int64
+}
+
+func New() any {
+	return &Wrapper{Prefix: 111, FileMode: 11}
+}
+
+func main() {}
+`
+	allocatedTrailing, cachedTrailing := loadAndMeasure(srcTrailing, "trailing", os.FileMode(11).String())
+	if allocatedTrailing != allocatedSame || cachedTrailing != cachedSame {
+		t.Fatalf("trailing-only layout changed icall usage: alloc %d->%d cached %d->%d",
+			allocatedSame, allocatedTrailing, cachedSame, cachedTrailing)
 	}
 }
 
@@ -4028,6 +4153,52 @@ func main() {}
 	b, objB := loadPromotedWrapper(t, srcTrailing)
 	defer b.UnsafeRelease()
 	callPromotedString(t, "trailing", objB, os.FileMode(22).String())
+}
+
+// Receiver layouts coexist in one interpreter: the single-pointer wrapper
+// needs its own interface adapter, while trailing-field variants can share one.
+func TestPromotedMethodReceiverStorage(t *testing.T) {
+	const source = `package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+)
+
+type Wrapped struct {
+	*strings.Reader
+}
+
+type Wrapped1 struct {
+	*strings.Reader
+	Extra [3]int64
+}
+
+type Wrapped2 struct {
+	*strings.Reader
+	Extra [5]int64
+}
+
+func main() {
+	for _, reader := range []io.Reader{
+		Wrapped{Reader: strings.NewReader("hello")},
+		&Wrapped{Reader: strings.NewReader("hello")},
+		Wrapped1{Reader: strings.NewReader("hello")},
+		&Wrapped1{Reader: strings.NewReader("hello")},
+		Wrapped2{Reader: strings.NewReader("hello")},
+		&Wrapped2{Reader: strings.NewReader("hello")},
+	} {
+		data, err := io.ReadAll(reader)
+		if err != nil || string(data) != "hello" {
+			panic(fmt.Sprintf("%T: ReadAll = %q, %v; want %q, nil", reader, data, err, "hello"))
+		}
+	}
+}
+`
+	if _, err := ixgo.NewContext(0).RunFile("main.go", source, nil); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPrebuildSSA(t *testing.T) {
@@ -4758,6 +4929,9 @@ func main() {
 }
 
 func TestGCChannelSafepoints(t *testing.T) {
+	if ixgo.IsLLGo {
+		t.Skip("skip llgo: finalizer scheduling is runtime-dependent")
+	}
 	for _, park := range []string{
 		`<-release`,
 		`_, _ = <-release`,
@@ -4845,6 +5019,9 @@ func main() {
 }
 
 func TestGCLoopValueReclamation(t *testing.T) {
+	if ixgo.IsLLGo {
+		t.Skip("skip llgo: conservative GC may retain dead loop values")
+	}
 	const source = `package main
 import ("runtime"; "time")
 func allocate(finalized chan bool) []byte {

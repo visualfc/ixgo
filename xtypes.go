@@ -22,6 +22,7 @@ import (
 	"go/types"
 	"log"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -200,6 +201,7 @@ type mfnKey struct {
 	indexs   string
 	pointer  bool
 	indirect bool
+	onePtr   bool
 }
 
 type mfnValue struct {
@@ -207,16 +209,14 @@ type mfnValue struct {
 	id int
 }
 
-// indexsToString encodes the promotion path with outer size and field offsets,
-// e.g. "16.1@8.5". FuncId is reused as a reflectx method table entry, which
-// bakes in those offsets, so types that share a selection index but not a
-// layout must not share an id.
+// indexsToString encodes promoted field indices and offsets, e.g. ".1@8.5".
+// Size is omitted so compatible trailing fields share method tables; onePtr
+// in mfnKey separately distinguishes interface receiver representations.
 func indexsToString(typ reflect.Type, index []int) string {
 	if typ.Kind() == reflect.Ptr {
 		typ = typ.Elem()
 	}
 	var sb strings.Builder
-	sb.WriteString(strconv.FormatUint(uint64(typ.Size()), 10))
 	last := len(index) - 1
 	for i, v := range index {
 		sb.WriteByte('.')
@@ -233,6 +233,38 @@ func indexsToString(typ reflect.Type, index []int) string {
 		typ = f.Type
 	}
 	return sb.String()
+}
+
+const maxMethodPathPrefixes = 8
+
+type methodPathPrefix struct {
+	index  []int
+	prefix string
+}
+
+// A cache belongs to one setMethods call so field offsets are always for the
+// same receiver type. Bound the cache to keep uncommon wide method sets cheap.
+type methodPathPrefixes struct {
+	typ     reflect.Type
+	entries []methodPathPrefix
+}
+
+func (cache *methodPathPrefixes) encode(index []int) string {
+	fields := index[:len(index)-1]
+	for _, entry := range cache.entries {
+		if slices.Equal(fields, entry.index) {
+			return entry.prefix + strconv.Itoa(index[len(index)-1])
+		}
+	}
+	encoded := indexsToString(cache.typ, index)
+	if len(cache.entries) < maxMethodPathPrefixes {
+		prefix := encoded[:strings.LastIndexByte(encoded, '.')+1]
+		cache.entries = append(cache.entries, methodPathPrefix{
+			index:  append([]int(nil), fields...),
+			prefix: prefix,
+		})
+	}
+	return encoded
 }
 
 func (r *TypesRecord) Release() {
@@ -443,7 +475,7 @@ func (r *TypesRecord) extractMethodSet(T types.Type) (methods []*types.Selection
 				methods[i] = pmset.At(i)
 			}
 		} else {
-			mcache := make(map[string]*types.Selection)
+			mcache := make(map[string]*types.Selection, mcount)
 			for i := 0; i < mcount; i++ {
 				meth := mset.At(i)
 				mcache[meth.Obj().Id()] = meth
@@ -473,7 +505,7 @@ func (r *TypesRecord) extractMethodSet(T types.Type) (methods []*types.Selection
 			}
 			methods = methods[:pcount]
 		} else {
-			mcache := make(map[string]*types.Selection)
+			mcache := make(map[string]*types.Selection, mcount)
 			for i, n := 0, mcount; i < n; i++ {
 				meth := mset.At(i)
 				if isGenericMethod(meth) {
@@ -624,9 +656,8 @@ func embedFunc(typ reflect.Type, name string, idx []int, pointer bool, indirect 
 
 // mfnMap and mfnId are process-global: they cache embed-func closures and
 // FuncIds across all Context instances. Entries are never evicted. Closures
-// stored here must not capture any per-Context state. FuncId identifies a
-// reflectx method table entry, so indexs includes offsets along the
-// promotion path.
+// stored here must not capture any per-Context state.
+// IDs become reflectx.Method.FuncId keys in reflectx's global method cache.
 var (
 	mfnId  int64
 	mfnMap sync.Map
@@ -639,13 +670,23 @@ var (
 )
 
 func (r *TypesRecord) setMethods(typ reflect.Type, methods []*types.Selection) {
+	pathPrefixes := methodPathPrefixes{typ: typ}
 	numMethods := len(methods)
 	ms := make([]reflectx.Method, numMethods)
 	checkXGo := r.ctx.Mode&CheckGopOverloadFunc != 0
+	// Only the struct case of reflectx.setupMethodTables applies to promoted
+	// methods: a struct containing just one pointer needs a distinct wrapper.
+	onePtr := typ.Kind() == reflect.Struct && typ.NumField() == 1 && typ.Field(0).Type.Kind() == reflect.Ptr
 	for i := 0; i < numMethods; i++ {
 		fn := methods[i].Obj().(*types.Func)
-		sig := methods[i].Type().(*types.Signature)
-		pointer := isPointer(sig.Recv().Type())
+		// Previously:
+		// sig := methods[i].Type().(*types.Signature)
+		// pointer := isPointer(sig.Recv().Type())
+		// ToType uses only parameters, results, and variadic status. Reuse the
+		// declaration signature to avoid copying the signature and receiver;
+		// Selection.Recv preserves the selected receiver's pointer semantics.
+		sig := fn.Type().(*types.Signature)
+		pointer := isPointer(methods[i].Recv())
 		mtyp, _ := r.ToType(sig)
 		var mfn func(args []reflect.Value) []reflect.Value
 		idx := methods[i].Index()
@@ -654,14 +695,15 @@ func (r *TypesRecord) setMethods(typ reflect.Type, methods []*types.Selection) {
 			mid = -1
 		} else if len(idx) > 1 {
 			indirect := methods[i].Indirect()
-			rtyp := fn.Type().Underlying().(*types.Signature).Recv().Type()
+			rtyp := sig.Recv().Type()
 			rt, _ := r.ToType(rtyp)
 			key := mfnKey{
 				typ:      rt,
 				name:     fn.Name(),
-				indexs:   indexsToString(typ, idx),
+				indexs:   pathPrefixes.encode(idx),
 				pointer:  pointer,
 				indirect: indirect,
+				onePtr:   onePtr,
 			}
 			actual, ok := mfnMap.Load(key)
 			if !ok {

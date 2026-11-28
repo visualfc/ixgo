@@ -91,7 +91,7 @@ func (visit *visitor) program() {
 		if isExtern(typ) {
 			return
 		}
-		mmap := make(map[string]*ssa.Function)
+		mmap := make(map[string]*function)
 		mset := visit.prog.MethodSets.MethodSet(T)
 		checkXGo := visit.intp.ctx.Mode&CheckGopOverloadFunc != 0
 		for i, n := 0, mset.Len(); i < n; i++ {
@@ -110,7 +110,7 @@ func (visit *visitor) program() {
 				}
 			}
 			fn := visit.prog.MethodValue(sel)
-			mmap[obj.Name()] = fn
+			mmap[obj.Name()] = visit.intp.loadFunction(fn)
 			visit.function(fn)
 		}
 		visit.intp.msets[typ] = mmap
@@ -291,10 +291,15 @@ func (visit *visitor) function(fn *ssa.Function) {
 		// Reserve tracking state after the fixed call slots.
 		pfn.stack = append(pfn.stack, nil)
 	}
+
 	var buf [32]*ssa.Value // avoid alloc in common case
 	for _, b := range fn.Blocks {
 		Instrs := make([]func(*frame), len(b.Instrs))
 		ssaInstrs := make([]ssa.Instruction, len(b.Instrs))
+		var descriptions []typedInstruction
+		if instructionSupported && visit.intp.ctx.Mode&(EnableInstructionDescriptions|EnableInstructionExecution) != 0 {
+			descriptions = make([]typedInstruction, len(b.Instrs))
+		}
 		var index int
 		n := len(b.Instrs)
 		for i := 0; i < n; i++ {
@@ -340,6 +345,20 @@ func (visit *visitor) function(fn *ssa.Function) {
 			ifn := makeInstr(visit.intp, pfn, instr)
 			if ifn == nil {
 				continue
+			}
+			if instructionSupported && visit.intp.ctx.Mode&(EnableInstructionDescriptions|EnableInstructionExecution) != 0 {
+				var dests []register
+				if call, ok := instr.(ssa.Value); ok {
+					dests = describeCallResults(pfn, call)
+				}
+				descriptions[index] = describeInstruction(pfn, instr, instr.Operands(buf[:0]), dests)
+				bindRuntimeRegisters(&descriptions[index])
+				if visit.intp.ctx.Mode&EnableInstructionExecution != 0 {
+					// Use the bound runtime registers for supported instructions.
+					if described := makeInstruction(visit.intp, descriptions[index]); described != nil {
+						ifn = described
+					}
+				}
 			}
 			if visit.intp.ctx.evalMode && fn.String() == "main.init" {
 				if visit.intp.ctx.evalInit == nil {
@@ -435,6 +454,9 @@ func (visit *visitor) function(fn *ssa.Function) {
 		pfn.Blocks = append(pfn.Blocks, offset)
 		pfn.Instrs = append(pfn.Instrs, Instrs[:index]...)
 		pfn.ssaInstrs = append(pfn.ssaInstrs, ssaInstrs[:index]...)
+		if instructionSupported && visit.intp.ctx.Mode&(EnableInstructionDescriptions|EnableInstructionExecution) != 0 {
+			pfn.Code = append(pfn.Code, descriptions[:index]...)
+		}
 		if b == fn.Recover && visit.intp.ctx.Mode&DisableRecover == 0 {
 			pfn.Recover = pfn.Instrs[offset:]
 		}
@@ -471,6 +493,7 @@ func (visit *visitor) function(fn *ssa.Function) {
 	pfn.base = visit.base
 	visit.base += len(pfn.ssaInstrs) + 2
 	pfn.initPool()
+	pfn.finishMetadata()
 }
 
 func loc(fset *token.FileSet, pos token.Pos) string {
@@ -561,4 +584,27 @@ func namedResultAlloc(fn *ssa.Function, res *types.Var) *ssa.Alloc {
 		}
 	}
 	return nil
+}
+
+// finishMetadata snapshots locations after instruction elision and return wrapping.
+func (p *function) finishMetadata() {
+	fn := p.Fn
+	p.metadata.name = fn.String()
+	p.metadata.fileSet = fn.Prog.Fset
+	if strings.HasSuffix(p.metadata.name, "$thunk") {
+		p.metadata.interfaceThunk = isInterfaceThunk(fn.Signature)
+	}
+	p.metadata.entry = fn.Prog.Fset.Position(fn.Pos())
+	p.metadata.sourcePositions = make([]token.Pos, len(p.ssaInstrs))
+	for pc, instr := range p.ssaInstrs {
+		if instr == nil {
+			continue
+		}
+		pos := instr.Pos()
+		// RunDefers locations conventionally point at the function's closing brace.
+		if _, ok := instr.(*ssa.RunDefers); ok && fn.Syntax() != nil {
+			pos = fn.Syntax().End()
+		}
+		p.metadata.sourcePositions[pc] = pos
+	}
 }

@@ -17,6 +17,9 @@
 package ixgo
 
 import (
+	"fmt"
+	"go/types"
+	"reflect"
 	"testing"
 )
 
@@ -97,5 +100,248 @@ func main() {
 	}
 	if _, err := interp.RunMain(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSetMethodsDeclarationSignature(t *testing.T) {
+	const src = `package main
+import "reflect"
+
+type Base struct { N int }
+func (b Base) Value(n int) int { return b.N + n }
+func (b *Base) Add(n int) int { b.N += n; return b.N }
+func (b Base) Sum(ns ...int) int {
+ result := b.N
+ for _, n := range ns { result += n }
+ return result
+}
+type Outer struct { Base }
+type PointerOuter struct { *Base }
+type Nested struct { Outer }
+type Box[T any] struct { V T }
+func (b Box[T]) Get() T { return b.V }
+func (b *Box[T]) Set(v T) { b.V = v }
+type IntOuter struct { Box[int] }
+type StringOuter struct { *Box[string] }
+
+func check(v bool) { if !v { panic("method signature regression") } }
+func value(v interface { Value(int) int }, n int) int { return v.Value(n) }
+func add(v interface { Add(int) int }, n int) int { return v.Add(n) }
+func main() {
+ b := Base{N: 1}
+ check(value(b, 2) == 3)
+ check(add(&b, 3) == 4)
+ o := Outer{Base{N: 10}}
+ check(value(o, 2) == 12)
+ check(add(&o, 3) == 13 && o.N == 13)
+ p := PointerOuter{&Base{N: 20}}
+ check(value(p, 2) == 22)
+ check(add(p, 3) == 23 && p.N == 23)
+ n := Nested{Outer{Base{N: 30}}}
+ check(value(n, 2) == 32)
+ check(add(&n, 3) == 33 && n.N == 33)
+ for index, v := range []interface{}{b, o, p, n} {
+  rv := reflect.ValueOf(v)
+  want := []int64{4, 13, 23, 33}[index]
+  check(rv.MethodByName("Value").Call([]reflect.Value{reflect.ValueOf(2)})[0].Int() == want + 2)
+  check(rv.MethodByName("Sum").CallSlice([]reflect.Value{reflect.ValueOf([]int{2, 3})})[0].Int() == want + 5)
+ }
+ check(reflect.ValueOf(&o).MethodByName("Add").Call([]reflect.Value{reflect.ValueOf(1)})[0].Int() == 14)
+ check(o.N == 14)
+ check(reflect.ValueOf(o).MethodByName("Add").IsValid() == false)
+ check(reflect.ValueOf(&o).MethodByName("Add").IsValid())
+ check(reflect.ValueOf(p).MethodByName("Add").IsValid())
+ i := IntOuter{Box[int]{V: 42}}
+ var ig interface { Get() int } = i
+ check(ig.Get() == 42)
+ var is interface { Set(int) } = &i
+ is.Set(43)
+ check(i.Get() == 43)
+ check(reflect.ValueOf(i).MethodByName("Get").Call(nil)[0].Int() == 43)
+ s := StringOuter{&Box[string]{V: "first"}}
+ var sg interface { Get() string } = s
+ check(sg.Get() == "first")
+ var ss interface { Set(string) } = s
+ ss.Set("second")
+ check(s.Get() == "second")
+ check(reflect.ValueOf(s).MethodByName("Get").Call(nil)[0].String() == "second")
+}
+`
+	for _, mode := range []Mode{0, SupportMultipleInterp, SupportMultipleInterp | CheckGopOverloadFunc} {
+		t.Run(fmt.Sprintf("mode_%d", mode), func(t *testing.T) {
+			ctx := NewContext(mode)
+			pkg, err := ctx.LoadFile("main.go", src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for n := 0; n < 2; n++ {
+				interp, err := NewInterp(ctx, pkg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				func() {
+					defer interp.UnsafeRelease()
+					for _, name := range []string{"Base", "Outer", "PointerOuter", "Nested", "IntOuter", "StringOuter"} {
+						typ := pkg.Type(name).Type()
+						for _, recv := range []types.Type{typ, types.NewPointer(typ)} {
+							mset := pkg.Prog.MethodSets.MethodSet(recv)
+							for j := 0; j < mset.Len(); j++ {
+								sel := mset.At(j)
+								selectedSig := sel.Type().(*types.Signature)
+								declaredSig := sel.Obj().Type().(*types.Signature)
+								selectedType, selectedNested := interp.record.ToType(selectedSig)
+								declaredType, declaredNested := interp.record.ToType(declaredSig)
+								if selectedType != declaredType || selectedNested != declaredNested {
+									t.Fatalf("%s: selected signature converts to (%v, %v), declaration to (%v, %v)", sel, selectedType, selectedNested, declaredType, declaredNested)
+								}
+								if isPointer(selectedSig.Recv().Type()) != isPointer(sel.Recv()) {
+									t.Fatalf("%s: selected receiver pointer flag differs from signature", sel)
+								}
+							}
+						}
+					}
+					if err := interp.RunInit(); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := interp.RunMain(); err != nil {
+						t.Fatal(err)
+					}
+				}()
+			}
+		})
+	}
+}
+
+func TestMethodPathPrefixes(t *testing.T) {
+	type leaf struct{ N int }
+	type middle struct {
+		Pad [3]int
+		P   *leaf
+		V   leaf
+	}
+	type outer struct {
+		Pad byte
+		M   middle
+		P   *middle
+	}
+	for _, typ := range []reflect.Type{reflect.TypeOf(outer{}), reflect.TypeOf(&outer{})} {
+		cache := methodPathPrefixes{typ: typ}
+		for repeat := 0; repeat < 2; repeat++ {
+			for _, fields := range [][]int{{1}, {2}, {1, 1}, {1, 2}, {2, 1}, {2, 2}} {
+				for _, method := range []int{0, 1, 99, 100, 513} {
+					index := append(append([]int(nil), fields...), method)
+					want := indexsToString(typ, index)
+					if got := cache.encode(index); got != want {
+						t.Fatalf("%v %v: got %q, want %q", typ, index, got, want)
+					}
+					// Selections may share index storage; the cache must own its copy.
+					index[0] = 0
+				}
+			}
+		}
+		if len(cache.entries) != 6 {
+			t.Fatalf("got %d prefixes, want 6", len(cache.entries))
+		}
+	}
+	fields := make([]reflect.StructField, maxMethodPathPrefixes+2)
+	for i := range fields {
+		fields[i] = reflect.StructField{Name: fmt.Sprintf("F%d", i), Type: reflect.TypeOf(leaf{})}
+	}
+	typ := reflect.StructOf(fields)
+	cache := methodPathPrefixes{typ: typ}
+	for repeat := 0; repeat < 2; repeat++ {
+		for i := range fields {
+			index := []int{i, repeat}
+			if got, want := cache.encode(index), indexsToString(typ, index); got != want {
+				t.Fatalf("wide path %v: got %q, want %q", index, got, want)
+			}
+		}
+	}
+	if len(cache.entries) != maxMethodPathPrefixes {
+		t.Fatalf("cache size = %d, want %d", len(cache.entries), maxMethodPathPrefixes)
+	}
+}
+
+func TestMethodPathPrefixesReceiverTypes(t *testing.T) {
+	type leaf struct{ N int }
+	type small struct {
+		Pad   byte
+		Value leaf
+	}
+	type large struct {
+		Pad   [128]byte
+		Value leaf
+	}
+	smallType, largeType := reflect.TypeOf(small{}), reflect.TypeOf(large{})
+	caches := []methodPathPrefixes{{typ: smallType}, {typ: largeType}}
+	if smallType.Field(1).Offset == largeType.Field(1).Offset {
+		t.Fatal("test requires different field offsets")
+	}
+	for repeat := 0; repeat < 2; repeat++ {
+		for i := range caches {
+			index := []int{1, repeat}
+			cache := &caches[i]
+			if got, want := cache.encode(index), indexsToString(cache.typ, index); got != want {
+				t.Fatalf("%v: got %q, want %q", cache.typ, got, want)
+			}
+		}
+	}
+}
+
+func BenchmarkMethodPathPrefixes(b *testing.B) {
+	type leaf struct{ N int }
+	type outer struct {
+		Pad      byte
+		Embedded leaf
+	}
+	typ := reflect.TypeOf(outer{})
+	for _, reuse := range []bool{false, true} {
+		b.Run(fmt.Sprintf("reuse_%v", reuse), func(b *testing.B) {
+			b.ReportAllocs()
+			for n := 0; n < b.N; n++ {
+				cache := methodPathPrefixes{typ: typ}
+				for method := 0; method < 500; method++ {
+					index := []int{1, method}
+					var encoded string
+					if reuse {
+						encoded = cache.encode(index)
+					} else {
+						encoded = indexsToString(typ, index)
+					}
+					if len(encoded) == 0 {
+						b.Fatal("empty encoding")
+					}
+				}
+			}
+		})
+	}
+}
+
+// The SSA builder uses a synthetic type with this unqualified spelling.
+type testDeferStackType struct{ types.Type }
+
+func (testDeferStackType) String() string { return "deferStack" }
+
+func TestLoadTypeDeferStack(t *testing.T) {
+	elem := testDeferStackType{types.Typ[types.UnsafePointer]}
+	ptr := types.NewPointer(elem)
+	result := types.NewTuple(types.NewVar(0, nil, "", ptr))
+	sig := types.NewSignatureType(nil, nil, nil, nil, result, false)
+	pptr := types.NewPointer(ptr)
+	for _, typ := range []types.Type{sig, pptr} {
+		interp := &Interp{preloadTypes: make(map[types.Type]reflect.Type)}
+		interp.loadType(typ)
+		pt := reflect.TypeOf((*_defer)(nil))
+		if interp.preloadTypes[elem] != pt || interp.preloadTypes[ptr] != reflect.PointerTo(pt) {
+			t.Fatalf("%v: incorrect defer stack element or pointer mapping", typ)
+		}
+		want := reflect.PointerTo(reflect.PointerTo(pt))
+		if typ == sig {
+			want = reflect.FuncOf(nil, []reflect.Type{reflect.PointerTo(pt)}, false)
+		}
+		if got := interp.preloadTypes[typ]; got != want {
+			t.Fatalf("%v: got %v, want %v", typ, got, want)
+		}
+		interp.loadType(typ)
 	}
 }
