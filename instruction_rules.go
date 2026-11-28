@@ -1,5 +1,7 @@
 package ixgo
 
+//go:generate go run instruction_exec_gen.go
+
 import (
 	"go/types"
 

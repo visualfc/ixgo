@@ -539,7 +539,24 @@ func referenceGCRegsAt(pfn *function, pc int) []register {
 			delete(live, v)
 		}
 		if _, ok := instr.(*ssa.Phi); !ok {
-			ops = closureLivenessOperands(instr, ops[:0])
+			ops = instr.Operands(ops[:0])
+			// Expand captures independently of the production helper. A closure
+			// without a result slot is read through its bindings at each use.
+			for _, op := range ops[:len(ops)] {
+				if op == nil {
+					continue
+				}
+				closure, ok := (*op).(*ssa.MakeClosure)
+				if !ok {
+					continue
+				}
+				if _, allocated := pfn.index[closure]; allocated {
+					continue
+				}
+				for i := range closure.Bindings {
+					ops = append(ops, &closure.Bindings[i])
+				}
+			}
 			for _, op := range ops {
 				if *op != nil {
 					live[*op] = true
