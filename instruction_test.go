@@ -5878,3 +5878,53 @@ func Nil()int {var v target;return v.Value()}
 		}
 	}
 }
+
+func TestInstructionDirectPhiPlan(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprint(bound), func(t *testing.T) {
+			aux := phiAux{Results: []register{0, 1}, Edges: [][]register{{2, 4, 6}, {3, 5, 7}}, Preds: []int32{3, 8, 12}}
+			d := typedInstruction{Op: opPhi, Aux: aux}
+			if bound {
+				bindRuntimeRegisters(&d)
+				aux = d.Aux.(phiAux)
+			}
+			run := makeInstruction(nil, d)
+			for _, tc := range []struct {
+				pred int32
+				want []value
+			}{{3, []value{20, 30}}, {8, []value{40, 50}}, {12, []value{60, 70}}, {99, []value{0, 1}}} {
+				fr := &frame{pred: tc.pred, stack: []value{0, 1, 20, 30, 40, 50, 60, 70}}
+				run(fr)
+				if !reflect.DeepEqual(fr.stack[:2], tc.want) {
+					t.Fatalf("pred %d=%v want %v", tc.pred, fr.stack[:2], tc.want)
+				}
+				if allocs := testing.AllocsPerRun(100, func() { run(fr) }); allocs != 0 {
+					t.Fatalf("execution allocated %v times", allocs)
+				}
+				if fr.phiVals != nil {
+					t.Fatal("direct Phi used cyclic scratch storage")
+				}
+			}
+			// Direct plans snapshot the bound mapping; rewriting metadata requires
+			// rebuilding the executor, including its parallel-assignment analysis.
+			aux.Edges[0][0] = 7
+			if bound {
+				aux.RuntimeEdges[0][0] = 6
+			}
+			fr := &frame{pred: 3, stack: []value{0, 1, 20, 30, 40, 50, 60, 70}}
+			run(fr)
+			if fr.reg(0) != 20 {
+				t.Fatal("compiled plan changed with metadata")
+			}
+			run = makeInstruction(nil, typedInstruction{Op: opPhi, Aux: aux, RuntimeBound: bound})
+			run(fr)
+			want := 70
+			if bound {
+				want = 60
+			}
+			if fr.reg(0) != want {
+				t.Fatalf("rebuilt plan got %v want %d", fr.reg(0), want)
+			}
+		})
+	}
+}

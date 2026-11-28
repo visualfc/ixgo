@@ -738,11 +738,21 @@ func makeInstruction(interp *Interp, d typedInstruction) func(*frame) {
 			}
 		}
 		if phiDirectAssignment(ir, ie) {
+			type move struct{ dst, src register }
+			// Snapshot direct assignments in predecessor-major order so execution
+			// reads a contiguous plan instead of indexing each edge slice.
+			moves := make([]move, len(preds)*len(ir))
+			for j := range preds {
+				for i, result := range ir {
+					moves[j*len(ir)+i] = move{result, ie[i][j]}
+				}
+			}
+			count := len(ir)
 			return func(fr *frame) {
 				for j, pred := range preds {
 					if fr.pred == pred {
-						for i, result := range ir {
-							fr.setReg(result, fr.reg(ie[i][j]))
+						for _, m := range moves[j*count : (j+1)*count] {
+							fr.setReg(m.dst, fr.reg(m.src))
 						}
 						return
 					}
